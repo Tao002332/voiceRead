@@ -1,0 +1,5 @@
+PySide6>=6.5.0
+edge-tts>=6.1.0
+requests>=2.28.0
+pyttsx3>=2.90
+comtypes>=1.2.0
