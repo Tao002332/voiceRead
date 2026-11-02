@@ -98,7 +98,8 @@ class PlaybackController(QObject):
         self.sentences: list = []
         self.prosodies: list[Prosody] = []
         self.display_text = ""
-        self.index = 0                       # 下一句要播的位置
+        self.index = 0                       # 当前显示（播放头）的句子
+        self._queue_head = 0                 # 预加载队列的消费起点（与显示位置解耦）
 
         self._items: dict[int, _Item] = {}
         # 一个缓存 key 可能对应多个句子（重复台词/重复的"……"），
@@ -207,12 +208,13 @@ class PlaybackController(QObject):
         return item
 
     def _pump(self) -> None:
-        """把 [index, index+depth) 补进预加载队列；已就绪的直接标记。"""
+        """把 [队列头, 队列头+depth) 补进预加载队列；已就绪的直接标记。"""
         if not self.sentences:
             return
         depth = self._depth()
-        end = min(len(self.sentences), self.index + depth)
-        for i in range(self.index, end):
+        head = self._queue_head
+        end = min(len(self.sentences), head + depth)
+        for i in range(head, end):
             item = self._items.get(i)
             if item is None:
                 item = self._make_item(i)
@@ -243,10 +245,14 @@ class PlaybackController(QObject):
                 item.finished_at = time.time()
                 item.cost = max(0.0, item.finished_at - item.started_at)
         # 清掉窗口之外的条目（已经在前面播过的会在 _advance 里移除）
-        for key in [k for k in self._items if k < self.index or k >= end]:
+        for key in [k for k in self._items if k < head or k >= end]:
             item = self._items.pop(key, None)
             if item is not None and item.key:
-                self._key_to_index.pop(item.key, None)
+                bucket = self._key_to_index.get(item.key)
+                if bucket is not None:
+                    bucket.discard(key)
+                    if not bucket:
+                        self._key_to_index.pop(item.key, None)
         self._emit_stats()
 
     def _emit_stats(self) -> None:
@@ -296,15 +302,19 @@ class PlaybackController(QObject):
                 self.player.play()
                 self._pos_timer.start()
             return
-        # 已经处于暂停：直接续播同一段
+        # 已经处于暂停：只有「显示位置仍在本段里」才续播，否则必须重新拼段，
+        # 不然会出现续播旧音频、字幕却是新句子的错位
         if (
             self._segment_path is not None
+            and self.index in self._segment
             and self.player.playbackState() == QMediaPlayer.PlaybackState.PausedState
         ):
             self.player.play()
             self._pos_timer.start()
             self._pump()
             return
+        if self._segment_path is not None and self.index not in self._segment:
+            self._stop_segment()
         self._pump()
         self._try_play()
 
@@ -348,7 +358,11 @@ class PlaybackController(QObject):
         self.sentenceSelected.emit(index, self.sentences[index].text)
         if self._want_playing:
             return
+        # 暂停时换位置：必须丢弃已拼好的段，否则再点播放会续播旧段的音频，
+        # 而字幕/高亮已经跳到新句子——这就是"音字不符"的来源之一
+        self._stop_segment()
         self.index = index
+        self._queue_head = index
         self._pump()
 
     def seek_sentence(self, index: int, autoplay: bool | None = None) -> None:
@@ -358,6 +372,7 @@ class PlaybackController(QObject):
         index = max(0, min(len(self.sentences) - 1, index))
         self._stop_segment()
         self.index = index
+        self._queue_head = index
         self._emit_sentence(index)
         self._pump()
         if want:
@@ -613,13 +628,17 @@ class PlaybackController(QObject):
         self._segment = []
         self._segment_playing = False
         for idx in consumed:
-            self._items.pop(idx, None)
-            for k, v in list(self._key_to_index.items()):
-                if v == idx:
-                    self._key_to_index.pop(k, None)
+            item = self._items.pop(idx, None)
+            if item is not None and item.key:
+                bucket = self._key_to_index.get(item.key)
+                if bucket is not None:
+                    bucket.discard(idx)
+                    if not bucket:
+                        self._key_to_index.pop(item.key, None)
         self._played_total += len(consumed)
         if consumed:
             self.index = consumed[-1] + 1
+            self._queue_head = self.index
         if self.index >= len(self.sentences):
             if self.book and self.chapter_index + 1 < self.book.chapter_count():
                 self.load_chapter(self.chapter_index + 1, 0, autoplay=True)
@@ -659,6 +678,7 @@ class PlaybackController(QObject):
             self._key_to_index.clear()
             self._last_emitted = -1
             self.index = keep
+            self._queue_head = keep
             self._emit_sentence(keep)
             self._pump()
             if was_playing:

@@ -106,6 +106,11 @@ def main() -> int:
     settings.speed = round(1.0 + random.uniform(0.05, 0.45), 3)
     settings.prosody_strength = round(random.uniform(0.6, 0.95), 2)
     service = SynthesisService(settings)
+    # 每次运行给缓存 key 加随机后缀：否则会命中历史缓存，
+    # _pump 直接判定"已就绪"，就测不到"生成中"的分支了
+    salt = format(random.getrandbits(24), "06x")
+    _orig_key_for = service.key_for
+    service.key_for = lambda text, req: _orig_key_for(text, req) + salt
     ctl = PlaybackController(settings, service)
 
     states: list[tuple[int, int, int, int]] = []
@@ -115,14 +120,27 @@ def main() -> int:
     pending: list[str] = []
 
     def fake_request(key: str, req) -> Path | None:
+        """defer 时只落 .tmp 占位，正式 wav 由 complete() 写入。
+
+        真实服务是「写 tmp → 原子改名」，如果这里直接写正式文件，
+        _pump 的 cached() 会误判成已就绪，就测不到等待分支了。
+        """
         path = CACHE_DIR / f"{key}.wav"
-        if not path.exists():
-            write_wav(path)
+        tmp = CACHE_DIR / f"{key}.tmp"
         if defer["on"]:
+            if not tmp.exists() and not path.exists():
+                tmp.write_bytes(b"pending")
             if key not in pending:
                 pending.append(key)
             return None          # 表示"还没生成完"，等 _on_ready 回调
+        write_wav(path)
         return path
+
+    def complete(index: int) -> None:
+        """模拟某一条生成完成：写入正式缓存并回调 ready。"""
+        key = ctl._items[index].key
+        write_wav(CACHE_DIR / f"{key}.wav")
+        ctl._on_ready(key)
 
     service.request = fake_request  # type: ignore[assignment]
 
@@ -152,8 +170,12 @@ def main() -> int:
     ctl.play()                      # 用户点了播放，此时还没有可播条目
     assert ctl._want_playing is True
     assert "play" not in stub.kinds(), "没有可播条目时不该直接播"
-    ctl._on_ready(first_key)        # 第 1 条生成完成
-    assert ctl._ready_ahead() >= 1
+    complete(first_index)            # 第 1 条生成完成（写盘 + ready 回调）
+    _it = ctl._items.get(first_index)
+    assert _it is not None, f"first_index={first_index} 不在队列里：{list(ctl._items)}"
+    assert ctl._ready_ahead() >= 1, (
+        f"state={_it.state} key={_it.key[:10]} map={list(ctl._key_to_index)[:3]} "
+        f"cached={ctl.service.cached(_it.key)}")
     assert "play" in stub.kinds(), f"已就绪 1 条却没有开播：{stub.calls}"
     assert ctl._segment and ctl._segment[0] == first_index, ctl._segment
     print(f"② 仅 1 条就绪即开播（段内 {len(ctl._segment)} 句）  ✓")
@@ -170,14 +192,16 @@ def main() -> int:
     assert len(ctl._items) <= depth, len(ctl._items)
     print(f"③ 消费 {len(consumed)} 条出队，index→{ctl.index}，队列 {len(ctl._items)}/{depth}  ✓")
 
-    # ---- 4) 补队列：把后面 3 条完成，队列重新填满
+    # ---- 4) 补队列：把队头开始的 3 条完成，重新有可播内容
     defer["on"] = True
     ctl._pump()
-    fill = [i for i in ctl._items if ctl._items[i].state == "running"][:3]
+    fill = [i for i in range(ctl._queue_head, ctl._queue_head + 3) if i in ctl._items]
     for i in fill:
-        ctl._on_ready(ctl._items[i].key)
+        if ctl._items[i].state != "ready":
+            complete(i)
     pump(app, 0.1)
-    assert ctl._ready_ahead() >= 1, "补进来的条目没变成就绪"
+    assert ctl._ready_ahead() >= 1, (
+        f"补进来的条目没变成就绪：{[(i, ctl._items[i].state) for i in fill]}")
     print(f"④ 补齐 3 条并转就绪，当前可播 {ctl._ready_ahead()} 条  ✓")
 
     # ---- 5) 状态信号：ready / depth / running / played 都在动
