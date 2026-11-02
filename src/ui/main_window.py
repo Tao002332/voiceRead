@@ -597,14 +597,15 @@ class MainWindow(QMainWindow):
             QApplication.clipboard().setText(sentence_text)
             self.status_label.setText("已复制这一句")
 
-    def _on_synth_progress(self, ready: int, depth: int, running: int, played: int) -> None:
-        """底栏实时数量：播放队列（已就绪待播）/ 预加载队列（深度内已排队）/ 生成中。"""
+    def _on_synth_progress(self, ready: int, queued: int, running: int, played: int) -> None:
+        """底栏实时数量：可播条数 / 队列内实际条数 / 生成中 / 已播。"""
+        depth = self.controller.queue_depth
         self.synth_queue = getattr(self, "synth_queue", {})
-        self.synth_queue.update(ready=ready, depth=depth, running=running, played=played)
+        self.synth_queue.update(ready=ready, queued=queued, running=running, played=played, depth=depth)
         self.synth_bar.setRange(0, max(1, depth))
         self.synth_bar.setValue(max(0, min(ready, depth)))
         self.synth_label.setText(
-            f"播放队列 {ready} 条可播 · 预加载队列 {depth} 条（生成中 {running}）· 已播 {played}"
+            f"播放队列 {ready} 条可播 · 预加载 {queued}/{depth}（生成中 {running}）· 已播 {played}"
         )
 
     def show_queue_detail(self) -> None:

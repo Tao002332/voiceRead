@@ -124,6 +124,11 @@ class PlaybackController(QObject):
         self._pos_timer.setInterval(120)
         self._pos_timer.timeout.connect(self._on_tick)
 
+        # 看门狗：兜住"队列里有可播条目却没被消费"和"段播完了但没收到 EndOfMedia"
+        self._guard = QTimer(self)
+        self._guard.setInterval(600)
+        self._guard.timeout.connect(self._guard_tick)
+
         self.player = QMediaPlayer(self)
         self.audio = QAudioOutput(self)
         self.audio.setVolume(1.0)
@@ -255,16 +260,30 @@ class PlaybackController(QObject):
                     if not bucket:
                         self._key_to_index.pop(item.key, None)
         self._emit_stats()
+        # 队列里已经有可播条目、但播放器闲着 —— 立刻消费，避免"生成了却不播"
+        if self._want_playing and not self._segment_playing and not self._reloading:
+            if self._ready_ahead() > 0:
+                self._try_play()
 
     def _emit_stats(self) -> None:
         ready = self._ready_ahead()
+        queued = len(self._items)
         depth = self._depth()
         running = self._running_count()
-        self.synthProgress.emit(ready, depth, running, self._played_total)
+        # (可播, 队列内实际条数, 生成中, 已播)
+        self.synthProgress.emit(ready, queued, running, self._played_total)
         loading = ready == 0
         if loading != self._last_loading:
             self._last_loading = loading
             self.loadingChanged.emit(loading)
+
+    @property
+    def queue_depth(self) -> int:
+        return self._depth()
+
+    @property
+    def queue_size(self) -> int:
+        return len(self._items)
 
     @property
     def is_loading(self) -> bool:
@@ -304,6 +323,7 @@ class PlaybackController(QObject):
             return
         self._want_playing = True
         self.playingChanged.emit(True)
+        self._guard.start()
         if self._segment_playing:
             if self.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
                 self.player.play()
@@ -327,6 +347,7 @@ class PlaybackController(QObject):
 
     def pause(self) -> None:
         self._want_playing = False
+        self._guard.stop()
         self._pos_timer.stop()
         self.playingChanged.emit(False)
         self.player.pause()
@@ -336,6 +357,7 @@ class PlaybackController(QObject):
     def stop(self) -> None:
         self._want_playing = False
         self._segment_playing = False
+        self._guard.stop()
         self._pos_timer.stop()
         self._manual_stop = True
         self.player.stop()
@@ -385,9 +407,11 @@ class PlaybackController(QObject):
         if want:
             self._want_playing = True
             self.playingChanged.emit(True)
+            self._guard.start()
             self._try_play()
         else:
             self._want_playing = False
+            self._guard.stop()
             self.playingChanged.emit(False)
 
     def seek_chapter(self, chapter: int, autoplay: bool | None = None) -> None:
@@ -402,6 +426,7 @@ class PlaybackController(QObject):
         self._played_total = 0
 
     def _stop_segment(self) -> None:
+        self._guard.stop()
         self._pos_timer.stop()
         self._segment_playing = False
         self._segment = []
@@ -627,9 +652,29 @@ class PlaybackController(QObject):
             return
         QTimer.singleShot(0, self._advance)
 
+    def _guard_tick(self) -> None:
+        """兜底：有可播条目就播；段真的播完了却没收到事件就推进。"""
+        if not self._want_playing or self._reloading:
+            return
+        if not self._segment_playing:
+            if self._ready_ahead() > 0:
+                self._try_play()
+            return
+        total = (self._segment_starts[-1] + self._segment_durs[-1]) if self._segment_starts else 0.0
+        pos = self.player.position() / 1000.0
+        ended = self.player.mediaStatus() == QMediaPlayer.MediaStatus.EndOfMedia
+        # 刚换源时媒体状态还残留着上一段的 EndOfMedia、而位置是 0，
+        # 这种"假结束"绝不能推进，否则会把刚拼好的新段也消费掉
+        if ended and total > 0 and pos < max(0.3, total - 0.6):
+            return
+        if ended or (total > 0 and pos > total + 1.5):
+            QTimer.singleShot(0, self._advance)
+
     def _advance(self) -> None:
         """一段播完：把消费掉的条目移出队列，补队列，再播下一段。"""
         if self._reloading or not self._want_playing:
+            return
+        if not self._segment:
             return
         consumed = list(self._segment)
         self._segment = []
@@ -651,6 +696,7 @@ class PlaybackController(QObject):
                 self.load_chapter(self.chapter_index + 1, 0, autoplay=True)
             else:
                 self._want_playing = False
+                self._guard.stop()
                 self._pos_timer.stop()
                 self.playingChanged.emit(False)
                 self.statusChanged.emit("已是全书末尾")
