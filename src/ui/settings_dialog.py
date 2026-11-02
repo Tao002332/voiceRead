@@ -140,9 +140,12 @@ class SettingsDialog(QDialog):
         form2.addRow("语调强度", self._wrap(strength_row))
 
         self.prefetch_spin = QSpinBox()
-        self.prefetch_spin.setRange(0, 8)
-        self.prefetch_spin.setToolTip("提前合成的句子数，越大越流畅但更吃 CPU/显卡")
-        form2.addRow("预合成句数", self.prefetch_spin)
+        self.prefetch_spin.setRange(1, 30)
+        self.prefetch_spin.setToolTip(
+            "预加载队列深度：提前把后面多少句排进队列去合成。\n"
+            "已经生成好的部分会立刻播放，不需要等队列填满"
+        )
+        form2.addRow("预加载队列深度", self.prefetch_spin)
 
         test_row = QHBoxLayout()
         self.test_btn = QPushButton("试听当前音色")

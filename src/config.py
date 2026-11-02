@@ -135,7 +135,8 @@ class Settings:
     pitch: int = 0                # 音调偏移（Hz），Edge 支持
     auto_prosody: bool = True     # 根据上下文自动调节
     prosody_strength: float = 1.0
-    prefetch: int = 3
+    prefetch: int = 10            # 预加载队列深度（条 = 句）
+    queue_model_v2: bool = False  # 迁移标记：老配置升到句子级队列
     cache_limit_mb: int = 800
     cache_retention_minutes: int = 10   # 音频缓存只保留最近 N 分钟
     last_book_id: str = ""
@@ -161,6 +162,11 @@ class Settings:
                 setattr(s, key, value)
         s.path = path
         s._seed_mambo_defaults()
+        # v1.1 起预加载改成"句子级队列"，默认深度 10；
+        # 老配置里的 3 是旧"预合成句数"语义，迁移一次即可
+        if not s.queue_model_v2:
+            s.prefetch = 10
+            s.queue_model_v2 = True
         return s
 
     def _seed_mambo_defaults(self) -> None:

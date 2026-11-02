@@ -8,9 +8,9 @@ import traceback
 from PySide6.QtCore import QEvent, QPoint, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QCursor, QFont, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QFileDialog, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
-    QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton, QSlider, QSplitter, QTextEdit,
-    QVBoxLayout, QWidget,
+    QApplication, QComboBox, QDialog, QFileDialog, QHBoxLayout, QHeaderView, QLabel,
+    QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton,
+    QSlider, QSplitter, QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from ..config import Settings
@@ -21,6 +21,21 @@ from ..core.tts.service import SynthesisService
 from .settings_dialog import SettingsDialog
 from .subtitle_window import SubtitleWindow
 from .theme import ACCENT, BORDER
+
+
+class _ClickLabel(QLabel):
+    """可点击的标签（用来点开预加载队列明细）。"""
+
+    clicked = Signal()
+
+    def __init__(self, text: str = "", parent: QWidget | None = None) -> None:
+        super().__init__(text, parent)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mouseReleaseEvent(event)
 
 
 class ReaderView(QTextEdit):
@@ -224,9 +239,11 @@ class MainWindow(QMainWindow):
         # 语音生成进度：常驻底栏，避免「还没生成」看起来像卡住
         prog_row = QHBoxLayout()
         prog_row.setSpacing(8)
-        self.synth_label = QLabel("语音：待生成")
+        self.synth_label = _ClickLabel("播放队列 0 · 预加载 0")
         self.synth_label.setObjectName("hint")
-        self.synth_label.setMinimumWidth(210)
+        self.synth_label.setMinimumWidth(300)
+        self.synth_label.setToolTip("点击查看预加载队列最近 10 条的生成耗时")
+        self.synth_label.clicked.connect(self.show_queue_detail)
         self.synth_bar = QProgressBar()
         self.synth_bar.setTextVisible(False)
         self.synth_bar.setFixedHeight(6)
@@ -578,24 +595,66 @@ class MainWindow(QMainWindow):
             QApplication.clipboard().setText(sentence_text)
             self.status_label.setText("已复制这一句")
 
-    def _on_synth_progress(self, cur_ready: int, cur_total: int, nxt_ready: int, nxt_total: int) -> None:
-        """底栏进度：本段没就绪就显示本段，否则显示下一段的后台生成进度。"""
-        if cur_total and cur_ready < cur_total:
-            self.synth_bar.setRange(0, cur_total)
-            self.synth_bar.setValue(cur_ready)
-            self.synth_label.setText(f"语音生成：当前段 {cur_ready}/{cur_total} 句")
-        elif nxt_total and nxt_ready < nxt_total:
-            self.synth_bar.setRange(0, nxt_total)
-            self.synth_bar.setValue(nxt_ready)
-            self.synth_label.setText(f"语音生成：下一段 {nxt_ready}/{nxt_total} 句")
-        elif cur_total:
-            self.synth_bar.setRange(0, 1)
-            self.synth_bar.setValue(1)
-            self.synth_label.setText("语音：本段已就绪")
-        else:
-            self.synth_bar.setRange(0, 1)
-            self.synth_bar.setValue(0)
-            self.synth_label.setText("语音：待生成")
+    def _on_synth_progress(self, ready: int, depth: int, running: int, played: int) -> None:
+        """底栏实时数量：播放队列（已就绪待播）/ 预加载队列（深度内已排队）/ 生成中。"""
+        self.synth_queue = getattr(self, "synth_queue", {})
+        self.synth_queue.update(ready=ready, depth=depth, running=running, played=played)
+        self.synth_bar.setRange(0, max(1, depth))
+        self.synth_bar.setValue(max(0, min(ready, depth)))
+        self.synth_label.setText(
+            f"播放队列 {ready} 条可播 · 预加载队列 {depth} 条（生成中 {running}）· 已播 {played}"
+        )
+
+    def show_queue_detail(self) -> None:
+        """点开预加载队列：最近 10 条各自的生成耗时。"""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("预加载队列明细")
+        dlg.resize(640, 320)
+        layout = QVBoxLayout(dlg)
+
+        info = QLabel(
+            f"队列深度 {self.settings.prefetch} 条 · 已就绪可播 "
+            f"{getattr(self, 'synth_queue', {}).get('ready', 0)} 条"
+        )
+        info.setObjectName("hint")
+        layout.addWidget(info)
+
+        table = QTableWidget(0, 5, dlg)
+        table.setHorizontalHeaderLabels(["句序", "状态", "字数", "生成耗时", "内容"])
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        layout.addWidget(table, 1)
+
+        def refresh() -> None:
+            rows = self.controller.recent_items(10)
+            table.setRowCount(len(rows))
+            for r, item in enumerate(rows):
+                values = [
+                    f"第 {item['index']} 句",
+                    item["state"],
+                    str(item["chars"]),
+                    f"{item['cost']:.2f} s" if item["cost"] else "—",
+                    item["text"],
+                ]
+                for c, val in enumerate(values):
+                    cell = QTableWidgetItem(val)
+                    if c in (0, 2, 3):
+                        cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    table.setItem(r, c, cell)
+            if not rows:
+                table.setRowCount(1)
+                table.setItem(0, 0, QTableWidgetItem("（队列里还没有生成记录）"))
+
+        timer = QTimer(dlg)
+        timer.setInterval(600)
+        timer.timeout.connect(refresh)
+        timer.start()
+        refresh()
+        dlg.exec()
 
     def _on_playing(self, playing: bool) -> None:
         self._refresh_play_button()
