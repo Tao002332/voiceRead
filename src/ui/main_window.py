@@ -96,6 +96,8 @@ class MainWindow(QMainWindow):
         self._primary_index: int | None = None    # 朗读位置（填充高亮）
         self._selected_index: int | None = None   # 左键选中（下划线标记）
         self._loading = False                     # 当前段语音是否还没就绪
+        self._last_speech_sig = self._speech_signature()
+        self._last_depth = int(self.settings.prefetch)
 
         self._speed_timer = QTimer(self)
         self._speed_timer.setSingleShot(True)
@@ -798,16 +800,41 @@ class MainWindow(QMainWindow):
         finally:
             self._settings_open = False
 
+    def _speech_signature(self) -> tuple:
+        """影响发音的参数组合：变了才需要重建音频。"""
+        s = self.settings
+        return (
+            round(float(s.speed), 3),
+            int(s.pitch),
+            bool(s.auto_prosody),
+            round(float(s.prosody_strength), 3),
+            s.engine_id,
+            s.edge_voice,
+            s.sapi_voice,
+            int(s.mambo.active_preset),
+        )
+
     def _after_settings(self) -> None:
-        """设置生效：分步执行、单步兜底；窗口层的改动再往后放一拍。"""
-        steps = (
+        """设置生效：分步执行、单步兜底；窗口层的改动再往后放一拍。
+
+        关键：只有「影响发音」的参数变了才重建音频；
+        只改预加载深度时走 set_depth()，**完全不动正在播放的音频**。
+        """
+        speech_changed = self._speech_signature() != getattr(self, "_last_speech_sig", None)
+        depth_changed = int(self.settings.prefetch) != getattr(self, "_last_depth", None)
+
+        steps = [
             ("刷新引擎下拉", self.refresh_engine_combo),
             ("重载引擎", self.service.reload_engine),
             ("按大小清理缓存", self.service.prune_cache),
             ("同步语速滑块", self._sync_speed_slider),
-            ("重建音频", self.controller.apply_settings_changed),
-            ("刷新引擎状态", self._prime_engine_status),
-        )
+        ]
+        if speech_changed:
+            steps.append(("重建音频", self.controller.apply_settings_changed))
+        elif depth_changed:
+            steps.append(("调整预加载深度", self.controller.set_depth))
+        steps.append(("刷新引擎状态", self._prime_engine_status))
+
         for name, fn in steps:
             try:
                 fn()
@@ -815,6 +842,9 @@ class MainWindow(QMainWindow):
                 self.status_label.setText(f"设置生效部分失败：{name}")
                 with open(self._settings_step_log(), "a", encoding="utf-8") as fh:
                     fh.write(f"\n--- {name} 失败 ---\n{traceback.format_exc()}")
+
+        self._last_speech_sig = self._speech_signature()
+        self._last_depth = int(self.settings.prefetch)
 
         # 改窗口 flag / show 这类操作与对话框销毁挤在一起容易出问题，延后一拍
         QTimer.singleShot(120, self._apply_subtitle_settings)

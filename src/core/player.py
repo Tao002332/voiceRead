@@ -244,8 +244,9 @@ class PlaybackController(QObject):
                 item.duration = self._wav_duration(path)
                 item.finished_at = time.time()
                 item.cost = max(0.0, item.finished_at - item.started_at)
-        # 清掉窗口之外的条目（已经在前面播过的会在 _advance 里移除）
-        for key in [k for k in self._items if k < head or k >= end]:
+        # 清掉窗口之外的条目（正在播放的段成员必须保留，否则会打断这一段的记账）
+        protected = set(self._segment)
+        for key in [k for k in self._items if (k < head or k >= end) and k not in protected]:
             item = self._items.pop(key, None)
             if item is not None and item.key:
                 bucket = self._key_to_index.get(item.key)
@@ -272,6 +273,12 @@ class PlaybackController(QObject):
     @property
     def is_playing(self) -> bool:
         return self._want_playing
+
+    def set_depth(self) -> None:
+        """只调整预加载深度：立刻扩容/收缩，**不动正在播放的音频**。"""
+        self._pump()
+        self._emit_stats()
+        self.statusChanged.emit(f"预加载队列深度已调整为 {self._depth()} 条（播放未中断）")
 
     def recent_items(self, limit: int = 10) -> list[dict]:
         """最近生成过的条目（按开始时间倒序），供 UI 展示耗时。"""
@@ -663,7 +670,11 @@ class PlaybackController(QObject):
 
     # ================================================================ 设置联动
     def apply_settings_changed(self) -> None:
-        """语速/音调/引擎变化：从当前句起用新参数重新排队。"""
+        """语速/音调/引擎变化：重建队列，但**不打断正在播放的这一段**。
+
+        正在出声时先把新参数的队列准备好，等本段自然播完再接上，
+        避免"改一下设置就断一下"的生硬切换。
+        """
         if not self.sentences:
             return
         auto = self.settings.auto_prosody
@@ -671,9 +682,9 @@ class PlaybackController(QObject):
         self.prosodies = [analyze(s.text, strength) if auto else Prosody() for s in self.sentences]
         keep = self.index
         was_playing = self._want_playing
+        playing_segment = self._segment_playing
         self._reloading = True
         try:
-            self._stop_segment()
             self._items.clear()
             self._key_to_index.clear()
             self._last_emitted = -1
@@ -681,7 +692,10 @@ class PlaybackController(QObject):
             self._queue_head = keep
             self._emit_sentence(keep)
             self._pump()
-            if was_playing:
+            if playing_segment:
+                # 当前段继续放，新参数的队列在后台准备，段尾无缝接上
+                self.statusChanged.emit("新设置已就绪，将在本段播完后生效")
+            elif was_playing:
                 self._want_playing = True
                 self.playingChanged.emit(True)
                 self._try_play()
