@@ -159,20 +159,20 @@ def main() -> int:
     assert "play" in kinds and "setSource" not in kinds, kinds
     print("④ 暂停恢复 → 直接 play，不重新 setSource  ✓")
 
-    # ---- 场景 5：左键选中 —— 只定位不播放；播放中会先暂停
+    # ---- 场景 5：左键选中（当前规格）—— 播放中不暂停、不动位置、不碰播放器
     stub.calls.clear()
     stub._state = QMediaPlayer.PlaybackState.PlayingState
     ctl._want_playing = True
-    emitted: list[int] = []
-    ctl.sentenceChanged.connect(lambda i, t, p: emitted.append(i))
+    ctl.index = 0
+    selected: list[int] = []
+    ctl.sentenceSelected.connect(lambda i, t: selected.append(i))
     ctl.select_sentence(3)
-    kinds = [c[0] for c in stub.calls]
-    print(f"左键选中：{kinds}  index={ctl.index}  播放中={ctl._want_playing}")
-    assert ctl.index == 3, ctl.index
-    assert ctl._want_playing is False, "播放中左键选中应先暂停，避免位置被覆盖"
-    assert "play" not in kinds, f"选中不应触发播放：{kinds}"
-    assert emitted and emitted[-1] == 3, emitted
-    print("⑤ 左键选中 → 暂停 + 定位，不播放  ✓")
+    print(f"左键选中：index={ctl.index} 播放中={ctl._want_playing} 调用={[c[0] for c in stub.calls]}")
+    assert ctl.index == 0, f"播放中选中不应改变播放位置：{ctl.index}"
+    assert ctl._want_playing is True, "播放中选中不应暂停"
+    assert selected and selected[-1] == 3, selected
+    assert stub.calls == [], f"选中不应触发任何播放器操作：{stub.calls}"
+    print("⑤ 播放中左键选中 → 不暂停、不动位置、不碰播放器  ✓")
 
     print("\n全部通过：点朗读会真正出声。")
     return 0

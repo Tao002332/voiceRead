@@ -80,6 +80,7 @@ class MainWindow(QMainWindow):
         self._last_saved_index = -1
         self._primary_index: int | None = None    # 朗读位置（填充高亮）
         self._selected_index: int | None = None   # 左键选中（下划线标记）
+        self._loading = False                     # 当前段语音是否还没就绪
 
         self._speed_timer = QTimer(self)
         self._speed_timer.setSingleShot(True)
@@ -282,6 +283,7 @@ class MainWindow(QMainWindow):
         c.error.connect(self._on_error)
         c.loaded.connect(self._on_chapter_loaded)
         c.synthProgress.connect(self._on_synth_progress)
+        c.loadingChanged.connect(self._on_loading)
 
         self.service.engine_changed.connect(lambda _eid: self._prime_engine_status())
 
@@ -596,6 +598,22 @@ class MainWindow(QMainWindow):
             self.synth_label.setText("语音：待生成")
 
     def _on_playing(self, playing: bool) -> None:
+        self._refresh_play_button()
+
+    def _on_loading(self, loading: bool) -> None:
+        """当前段语音还没生成好：禁用播放按钮，避免点了没反应。"""
+        self._loading = bool(loading)
+        self._refresh_play_button()
+
+    def _refresh_play_button(self) -> None:
+        if getattr(self, "_loading", False):
+            self.btn_play.setText("⏳ 语音加载中…")
+            self.btn_play.setEnabled(False)
+            self.subtitle.btn_play.setEnabled(False)
+            return
+        playing = self.controller.is_playing
+        self.btn_play.setEnabled(True)
+        self.subtitle.btn_play.setEnabled(True)
         self.btn_play.setText("⏸ 暂停" if playing else "▶ 朗读")
         self.subtitle.set_playing(playing)
 
@@ -625,7 +643,7 @@ class MainWindow(QMainWindow):
 
     def _on_error(self, message: str) -> None:
         self.status_label.setText(f"⚠ {message}")
-        self.btn_play.setText("▶ 朗读")
+        self._refresh_play_button()
 
     # ================================================================ 控制栏
     def _on_speed_slider(self, value: int) -> None:

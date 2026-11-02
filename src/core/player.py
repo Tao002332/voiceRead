@@ -76,6 +76,7 @@ class _Chunk:
 class PlaybackController(QObject):
     sentenceChanged = Signal(int, str, object)   # index, text, Prosody
     sentenceSelected = Signal(int, str)          # 仅左键选中（不改变字幕/朗读）
+    loadingChanged = Signal(bool)                # True = 当前段语音还没生成好
     chapterChanged = Signal(int)
     playingChanged = Signal(bool)
     progressChanged = Signal(int, int)
@@ -108,6 +109,10 @@ class PlaybackController(QObject):
         self._awaiting_seek: int | None = None
         self._awaiting_since = 0.0
         self._seek_retries = 0
+        # 当前块是否已经播完（播完后后端还会补发 Loaded/Buffered，
+        # 不加这个标记就会把播完的块从头再放一遍）
+        self._chunk_finished = False
+        self._last_loading: bool | None = None
         self._last_emitted = -1
         self._reloading = False
         self._last_touch = 0.0
@@ -194,6 +199,10 @@ class PlaybackController(QObject):
         chunk.building = True
         chunk.keys = []
         chunk.pending = 0
+        # 同一块里可能出现完全相同的句子（重复台词、重复的"……"），
+        # 它们的缓存 key 一样，而合成服务对同一个 key 只会回调一次 ready，
+        # 所以 pending 必须按「唯一 key」计数，否则计数永远减不到 0、块永远不就绪。
+        waiting_keys: set[str] = set()
         for si in range(chunk.start, chunk.end):
             text = self.sentences[si].text
             if not is_speakable(clean_for_tts(text)):
@@ -205,7 +214,8 @@ class PlaybackController(QObject):
             chunk.keys.append(key)
             self.service.clear_failure(key)
             path = self.service.request(key, req)
-            if path is None:
+            if path is None and key not in waiting_keys:
+                waiting_keys.add(key)
                 chunk.pending += 1
                 self._key_waiters.setdefault(key, set()).add(chunk.index)
         if chunk.pending == 0:
@@ -330,6 +340,17 @@ class PlaybackController(QObject):
         nxt_ready, nxt_total = stat(nxt)
         self.synthProgress.emit(cur_ready, cur_total, nxt_ready, nxt_total)
 
+        loading = not (cur is not None and cur.ready)
+        if loading != self._last_loading:
+            self._last_loading = loading
+            self.loadingChanged.emit(loading)
+
+    @property
+    def is_loading(self) -> bool:
+        """当前要读的这一段是否还没生成好（界面据此禁用播放按钮）。"""
+        chunk = self._chunk_of(self.index)
+        return not (chunk is not None and chunk.ready)
+
     def _on_chunk_ready(self, chunk: _Chunk) -> None:
         if self._pending_play and self._pending_play[0] == chunk.index:
             _, target = self._pending_play
@@ -351,6 +372,7 @@ class PlaybackController(QObject):
                 self.statusChanged.emit("该段缓存已过期，正在重新生成…")
                 return
         self._chunk_cursor = chunk.index
+        self._chunk_finished = False
         offset = 0.0
         pos = max(chunk.start, min(chunk.end - 1, sentence_idx))
         k = pos - chunk.start
@@ -383,44 +405,60 @@ class PlaybackController(QObject):
         if not self.sentences:
             self.statusChanged.emit("没有可朗读的内容")
             return
+        chunk = self._chunk_of(self.index)
+        if chunk is None:
+            return
+        # 语音还没生成好：先挂上待播，等它就绪自动开始（按钮此时应是禁用的）
+        if not chunk.ready:
+            self._want_playing = True
+            self.playingChanged.emit(True)
+            self._pending_play = (chunk.index, self.index)
+            self._prepare(chunk)
+            self.statusChanged.emit("语音生成中…就绪后自动播放")
+            return
+
         self._want_playing = True
         self.playingChanged.emit(True)
-        if self.player.playbackState() == QMediaPlayer.PlaybackState.PausedState and self._chunk_cursor >= 0:
+        if (
+            not self._chunk_finished
+            and self.player.playbackState() == QMediaPlayer.PlaybackState.PausedState
+        ):
             self.player.play()
             self._pos_timer.start()
             self._prefetch_next(self._chunk_cursor)
             return
-        chunk = self._chunk_of(self.index)
-        if chunk is None:
-            return
-        self._prepare(chunk)
-        if chunk.ready:
-            self._start_chunk(chunk, self.index)
-        else:
-            self._pending_play = (chunk.index, self.index)
-            self.statusChanged.emit("合成中…（准备本段）")
+        self._start_chunk(chunk, self.index)
 
     def pause(self) -> None:
         self._want_playing = False
+        # 取消「等下一段生成完自动播」的挂起状态，否则用户点了暂停又会被自动播起来
+        self._pending_play = None
         self._pause_timer.stop()
         self._pos_timer.stop()
         self.playingChanged.emit(False)
+        if self.is_loading:
+            self.statusChanged.emit("已暂停（语音仍在生成，就绪后不会自动播放）")
         self.player.pause()
+
+    def toggle(self) -> None:
+        if self._want_playing:
+            self.pause()
+        elif self.is_loading:
+            # 未就绪时按钮不可用，快捷键也忽略，避免出现「点了没反应」的错觉
+            self.statusChanged.emit("语音还没生成好，稍等一下再点播放")
+        else:
+            self.play()
 
     def stop(self) -> None:
         self._want_playing = False
+        self._pending_play = None
+        self._chunk_finished = True
         self._pause_timer.stop()
         self._pos_timer.stop()
         self._manual_stop = True
         self.player.stop()
         self._manual_stop = False
         self.playingChanged.emit(False)
-
-    def toggle(self) -> None:
-        if self._want_playing:
-            self.pause()
-        else:
-            self.play()
 
     # ---------------------------------------------------------------- 跳转
     def next_sentence(self, autoplay: bool | None = None) -> None:
@@ -659,6 +697,9 @@ class PlaybackController(QObject):
                     self._seek_retries = 0
                     QTimer.singleShot(400, self._verify_seek)
             if self._want_playing and self.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+                # 已经播完、正在等下一段时，后端补发的 Ready 事件不能触发重播
+                if self._chunk_finished:
+                    return
                 self.player.play()
                 self._pos_timer.start()
             return
@@ -666,6 +707,8 @@ class PlaybackController(QObject):
             return
         if self._manual_stop or not self._want_playing:
             return
+        # 标记本块已播完，直到下一块真正开始播之前都不允许再 play() 这一块
+        self._chunk_finished = True
         # 关键：不在 QMediaPlayer 的槽里直接操作播放器，推迟到下一轮事件循环
         QTimer.singleShot(0, self._advance_chunk)
 
