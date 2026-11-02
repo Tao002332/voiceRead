@@ -160,6 +160,9 @@ class PlaybackController(QObject):
         strength = self.settings.prosody_strength
         self.prosodies = [analyze(s.text, strength) if auto else Prosody() for s in self.sentences]
         self.index = max(0, min(max(0, len(self.sentences) - 1), sentence))
+        # 关键：换章必须把队列头也归零，否则新章节的队列窗口会落在旧章的句号之后，
+        # 一条都排不进来 —— 表现就是"到新的一章就卡住"
+        self._queue_head = self.index
         self._last_emitted = -1
         self.chapterChanged.emit(self.chapter_index)
         self.loaded.emit()
@@ -217,7 +220,9 @@ class PlaybackController(QObject):
         if not self.sentences:
             return
         depth = self._depth()
-        head = self._queue_head
+        # 队列头做一次越界保护：任何漏同步的路径都能自愈，不至于整章排不进队列
+        head = max(0, min(max(0, len(self.sentences) - 1), self._queue_head))
+        self._queue_head = head
         end = min(len(self.sentences), head + depth)
         for i in range(head, end):
             item = self._items.get(i)
@@ -653,10 +658,15 @@ class PlaybackController(QObject):
         QTimer.singleShot(0, self._advance)
 
     def _guard_tick(self) -> None:
-        """兜底：有可播条目就播；段真的播完了却没收到事件就推进。"""
+        """兜底：有可播条目就播；段真的播完了却没收到事件就推进；章尾没段也要能翻页。"""
         if not self._want_playing or self._reloading:
             return
         if not self._segment_playing:
+            # 本章已经读完：即使没有播放段（被暂停/清空过），也必须能进下一章，
+            # 否则会停在"章尾 + 空队列"上永远不动
+            if self.index >= len(self.sentences):
+                self._next_chapter()
+                return
             if self._ready_ahead() > 0:
                 self._try_play()
             return
@@ -670,11 +680,20 @@ class PlaybackController(QObject):
         if ended or (total > 0 and pos > total + 1.5):
             QTimer.singleShot(0, self._advance)
 
+    def _next_chapter(self) -> None:
+        """本章读完 → 进下一章；已是全书末尾就收尾。"""
+        if self.book and self.chapter_index + 1 < self.book.chapter_count():
+            self.load_chapter(self.chapter_index + 1, 0, autoplay=True)
+            return
+        self._want_playing = False
+        self._guard.stop()
+        self._pos_timer.stop()
+        self.playingChanged.emit(False)
+        self.statusChanged.emit("已是全书末尾")
+
     def _advance(self) -> None:
         """一段播完：把消费掉的条目移出队列，补队列，再播下一段。"""
         if self._reloading or not self._want_playing:
-            return
-        if not self._segment:
             return
         consumed = list(self._segment)
         self._segment = []
@@ -692,14 +711,7 @@ class PlaybackController(QObject):
             self.index = consumed[-1] + 1
             self._queue_head = self.index
         if self.index >= len(self.sentences):
-            if self.book and self.chapter_index + 1 < self.book.chapter_count():
-                self.load_chapter(self.chapter_index + 1, 0, autoplay=True)
-            else:
-                self._want_playing = False
-                self._guard.stop()
-                self._pos_timer.stop()
-                self.playingChanged.emit(False)
-                self.statusChanged.emit("已是全书末尾")
+            self._next_chapter()
             return
         self._emit_sentence(self.index)
         self._pump()
@@ -712,6 +724,7 @@ class PlaybackController(QObject):
         self._want_playing = False
         self._segment_playing = False
         self.playingChanged.emit(False)
+        self._guard.stop()
         self._pos_timer.stop()
 
     # ================================================================ 设置联动
